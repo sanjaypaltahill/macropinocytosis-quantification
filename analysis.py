@@ -9,18 +9,50 @@ Strategy
   2.  Filter out debris (too small) and partial cells cut off by the image edge.
   3.  Expand each nucleus outward, constrained to actin (red) signal, to fill
       the full cell body up to the red membrane boundary.
-  4.  Measure mean FITC/TMR (green) intensity inside each complete cell region.
-  5.  Save a side-by-side PNG (original composite | cell masks | FITC heat-map)
-      for every image, plus a summary CSV/XLSX across the whole folder.
+  4.  Measure raw dye intensity inside each cell region and report:
+        - mean_intensity                 : mean pixel value within the cell mask
+        - integrated_intensity           : sum of all pixel values within the cell mask
+                                           (total uptake per cell; preferred metric when
+                                           cell size varies between conditions)
+        - integrated_intensity_per_area  : integrated_intensity / pixel_count
+                                           (uptake density; corrects for cell-size bias)
+        - pixel_count                    : cell area in px²
+  5.  Save a side-by-side PNG (original composite | cell masks | dye heat-map)
+      for every image, plus a per-cell CSV for every image and a summary
+      CSV/XLSX across the whole folder.
 
-Channel layout (standard RGB TIF from fluorescence microscope)
-  index 0  →  Red   = actin  (cell boundary marker)
-  index 1  →  Green = FITC / TMR  (signal of interest)
-  index 2  →  Blue  = DAPI  (nuclear stain, used for segmentation)
+  The folder-level summary reports, per image:
+      n_cells, mean_integrated_intensity (mean across cells in that image),
+      total_integrated_intensity (sum across all cells in that image)
+  and a final TOTALS row across all images in the folder:
+      total n_cells, grand mean integrated intensity per cell,
+      grand total integrated intensity.
+
+Channel file naming convention
+-------------------------------
+  Each "image" is represented by THREE separate single-channel TIF files that
+  share a common base name and differ only in their channel suffix:
+
+      <basename>_ch00.tif   →  actin  (cell boundary marker)   [default]
+      <basename>_ch01.tif   →  dye / FITC / TMR  (signal)      [default]
+      <basename>_ch02.tif   →  DAPI  (nuclear stain)           [default]
+
+  Override which suffix maps to which role at the command line:
+
+      python analyze_macropinocytosis.py /path/to/folder \
+          --actin _ch00 --dye _ch01 --dapi _ch02
+
+  The script discovers triplets by scanning for all files whose stem ends with
+  the actin suffix, then locating the matching dye / dapi siblings.
+  A metadata subfolder (or any file that does not match) is silently skipped.
+
+  If your files have no shared base name, set TRIPLET_MODE = "sorted_order"
+  and the script will group sorted TIFs as consecutive triples instead.
 
 USAGE
 -----
     python analyze_macropinocytosis.py /path/to/folder
+    python analyze_macropinocytosis.py /path/to/folder --actin _ch02 --dapi _ch00 --dye _ch01
 
 REQUIREMENTS
 ------------
@@ -28,12 +60,13 @@ REQUIREMENTS
 
 OUTPUTS  (written to <folder>/results/)
 ---------------------------------------
-    side_by_side/<name>_analysis.png  – 3-panel figure per image
-    <name>_per_cell.csv               – per-cell data for every image
-    summary_table.csv / .xlsx         – n_cells + mean FITC intensity per image
+    side_by_side/<basename>_analysis.png  – 3-panel figure per image group
+    <basename>_per_cell.csv               – per-cell data for every image group
+    summary_table.csv / .xlsx             – per-image + TOTALS row summary
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -44,31 +77,40 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from scipy import ndimage
 from skimage.color import label2rgb
 from skimage.filters import gaussian, threshold_otsu
 from skimage.measure import label as sklabel, regionprops
-from skimage.morphology import closing, disk
+from skimage.morphology import closing, disk, erosion
 from skimage.segmentation import expand_labels, find_boundaries
 
 
 # ═══════════════════════════ TUNABLE PARAMETERS ═══════════════════════════════
 
-# ── Channel indices (0-based) after loading as (C, H, W) ────────────────────
-ACTIN_CH  = 0    # red   – defines cell body boundary
-FITC_CH   = 1    # green – fluorescence signal to measure
-DAPI_CH   = 2    # blue  – nuclei, used for cell counting & segmentation
+# ── How channel TIFs are grouped ─────────────────────────────────────────────
+# "suffix_match"  : look for files ending in the actin suffix, then find the
+#                   dye / dapi siblings with the same base name.
+# "sorted_order"  : group every sorted TIF as consecutive triples
+#                   (files 0-2 → image 1, files 3-5 → image 2, …).
+TRIPLET_MODE = "suffix_match"   # "suffix_match" | "sorted_order"
+
+# Default channel suffixes — override at runtime with --actin / --dapi / --dye
+DEFAULT_ACTIN_SUFFIX = "_ch00"
+DEFAULT_DYE_SUFFIX   = "_ch01"
+DEFAULT_DAPI_SUFFIX  = "_ch02"
 
 # ── DAPI nucleus detection ───────────────────────────────────────────────────
 DAPI_BLUR_SIGMA     = 4      # gaussian smoothing before threshold (pixels)
 DAPI_CLOSE_RADIUS   = 8      # morphological closing to fill holes in nuclei
 MIN_NUCLEUS_AREA    = 5000   # minimum nucleus area in px² (removes debris)
-EXCLUDE_EDGE_NUCLEI = False   # if True, skip nuclei touching the image border
+EXCLUDE_EDGE_NUCLEI = False  # if True, skip nuclei touching the image border
 
 # ── Cell body expansion ───────────────────────────────────────────────────────
 CELL_EXPANSION_PX   = 150    # max expansion radius from nucleus edge (pixels)
 ACTIN_PERCENTILE    = 50     # actin pixels above this percentile define cell
                              # territory.  Lower = more permissive expansion.
+BOUNDARY_ERODE_PX   = 4     # shrink each cell mask inward by this many pixels
+                             # after expansion, to pull the boundary just inside
+                             # the actin ring and avoid overcounting cell area.
 
 # ── Output ────────────────────────────────────────────────────────────────────
 RESULTS_DIR_NAME = "results"
@@ -76,41 +118,146 @@ RESULTS_DIR_NAME = "results"
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+# ─── file discovery ───────────────────────────────────────────────────────────
+
+def find_triplets(
+    folder: Path,
+    actin_suffix: str,
+    dapi_suffix: str,
+    dye_suffix: str,
+) -> list[tuple[Path, Path, Path, str]]:
+    """
+    Return a list of (actin_path, dye_path, dapi_path, basename) tuples,
+    one entry per logical image, sorted by basename.
+
+    In suffix_match mode the actin suffix is used as the anchor; the dye
+    and dapi siblings are located by replacing that suffix in the filename.
+    Skips any files / subdirectories that do not match the expected pattern.
+    """
+    tif_exts = {".tif", ".tiff"}
+
+    if TRIPLET_MODE == "sorted_order":
+        all_tifs = sorted(
+            p for p in folder.iterdir()
+            if p.is_file() and p.suffix.lower() in tif_exts
+        )
+        if len(all_tifs) % 3 != 0:
+            print(
+                f"  WARNING: {len(all_tifs)} TIF files found — "
+                "not a multiple of 3.  Trailing file(s) will be ignored."
+            )
+        triplets = []
+        for i in range(0, len(all_tifs) - 2, 3):
+            f_actin, f_dye, f_dapi = all_tifs[i], all_tifs[i + 1], all_tifs[i + 2]
+            basename = f_actin.stem
+            triplets.append((f_actin, f_dye, f_dapi, basename))
+        return triplets
+
+    # ── suffix_match (default) — anchor on the actin suffix ─────────────────
+    actin_files = sorted(
+        p for p in folder.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in tif_exts
+        and p.stem.lower().endswith(actin_suffix.lower())
+    )
+
+    triplets = []
+    missing  = []
+
+    for f_actin in actin_files:
+        stem_base = re.sub(
+            re.escape(actin_suffix) + r"$", "", f_actin.stem, flags=re.IGNORECASE
+        )
+        ext = f_actin.suffix
+
+        def find_sibling(suffix: str) -> Path:
+            p = f_actin.parent / (stem_base + suffix + ext)
+            if not p.exists():
+                alt = f_actin.parent / (stem_base + suffix + ext.upper())
+                p = alt if alt.exists() else p
+            return p
+
+        f_dye  = find_sibling(dye_suffix)
+        f_dapi = find_sibling(dapi_suffix)
+
+        ok = True
+        for p, label in [(f_dye, "dye (" + dye_suffix + ")"),
+                         (f_dapi, "dapi (" + dapi_suffix + ")")]:
+            if not p.exists():
+                missing.append(
+                    f"  MISSING {label}: {p.name}  (expected sibling of {f_actin.name})"
+                )
+                ok = False
+        if ok:
+            triplets.append((f_actin, f_dye, f_dapi, stem_base))
+
+    if missing:
+        print("\n".join(missing))
+
+    return triplets
+
+
 # ─── image loading ────────────────────────────────────────────────────────────
 
-def load_tif(path: Path):
+def load_channel(path: Path) -> np.ndarray:
     """
-    Load a TIF and return (actin, fitc, dapi) 2-D float32 arrays
-    plus an (H, W, 3) RGB array for display.
+    Load a single-channel TIF and return a 2-D float32 array (H, W).
 
     Handles:
-      (H, W, C)    interleaved  – most colour camera / ImageJ RGB exports
-      (C, H, W)    channel-first – OMERO / multi-channel stacks
-      (Z, C, H, W) Z-stack      – max-projected along Z first
+      (H, W)       grayscale — most single-channel exports
+      (H, W, 1)    extra trailing dimension
+      (1, H, W)    channel-first with one channel
+      (Z, H, W)    Z-stack — max-projected along Z
+      (Z, 1, H, W) Z-stack channel-first — max-projected
     """
-    raw = tifffile.imread(str(path))
-    img = raw.astype(np.float32)
+    raw = tifffile.imread(str(path)).astype(np.float32)
 
-    if img.ndim == 4:                  # Z-stack → max-project
-        img = img.max(axis=0)
+    if raw.ndim == 2:
+        return raw
 
-    if img.ndim != 3:
-        raise ValueError(f"Unexpected image shape {raw.shape} in {path.name}")
+    if raw.ndim == 3:
+        if raw.shape[0] == 1:
+            return raw[0]
+        if raw.shape[2] == 1:
+            return raw[..., 0]
+        return raw.max(axis=0)   # assume (Z, H, W) Z-stack
 
-    h, w = img.shape[0], img.shape[1]
-    last = img.shape[2]
-    if last <= 4 and last < h and last < w:   # (H, W, C) → (C, H, W)
-        img = np.moveaxis(img, -1, 0)
+    if raw.ndim == 4:
+        projected = raw.max(axis=0)
+        if projected.shape[0] == 1:
+            return projected[0]
+        if projected.shape[2] == 1:
+            return projected[..., 0]
+        return projected.max(axis=0)
 
-    if img.shape[0] < 3:
+    raise ValueError(
+        f"Cannot interpret shape {raw.shape} as a single-channel image: {path.name}"
+    )
+
+
+def load_triplet(f_actin: Path, f_dye: Path, f_dapi: Path):
+    """
+    Load the three channel TIFs and return:
+      actin  (float32, H×W)   – cell boundary marker
+      dye    (float32, H×W)   – signal of interest
+      dapi   (float32, H×W)   – nuclear stain
+      rgb    (float32, H×W×3) – composite for display (actin/dye/dapi → R/G/B)
+    """
+    actin = load_channel(f_actin)
+    dye   = load_channel(f_dye)
+    dapi  = load_channel(f_dapi)
+
+    shapes = {actin.shape, dye.shape, dapi.shape}
+    if len(shapes) > 1:
         raise ValueError(
-            f"{path.name}: only {img.shape[0]} channel(s) — need R/G/B.")
+            f"Channel size mismatch:\n"
+            f"  actin {actin.shape}  {f_actin.name}\n"
+            f"  dye   {dye.shape}    {f_dye.name}\n"
+            f"  dapi  {dapi.shape}   {f_dapi.name}"
+        )
 
-    actin = img[ACTIN_CH]
-    fitc  = img[FITC_CH]
-    dapi  = img[DAPI_CH]
-    rgb   = np.stack([img[0], img[1], img[2]], axis=-1)
-    return actin, fitc, dapi, rgb
+    rgb = np.stack([actin, dye, dapi], axis=-1)   # (H, W, 3) — R=actin G=dye B=dapi
+    return actin, dye, dapi, rgb
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
@@ -165,29 +312,62 @@ def segment_cells(actin: np.ndarray, dapi: np.ndarray):
         new_id += 1
 
     # ── Step 4: define cell territory from actin signal ──────────────────────
-    actin_smooth  = gaussian(actin, sigma=2)
-    actin_thresh  = np.percentile(actin_smooth, ACTIN_PERCENTILE)
+    actin_smooth   = gaussian(actin, sigma=2)
+    actin_thresh   = np.percentile(actin_smooth, ACTIN_PERCENTILE)
     cell_territory = (actin_smooth > actin_thresh) | (nuclear_labels > 0)
 
     # ── Step 5: expand nuclei outward, clipped to cell territory ─────────────
     cell_labels = expand_labels(nuclear_labels, distance=CELL_EXPANSION_PX)
     cell_labels[~cell_territory] = 0
 
+    # ── Step 6: erode each cell mask inward to tighten boundary fit ──────────
+    # Erodes the binary footprint of each label independently so cells don't
+    # bleed into each other; nuclei are never eroded below their original extent.
+    if BOUNDARY_ERODE_PX > 0:
+        erode_disk = disk(BOUNDARY_ERODE_PX)
+        tightened  = np.zeros_like(cell_labels)
+        for cid in range(1, int(cell_labels.max()) + 1):
+            cell_mask    = cell_labels == cid
+            eroded_mask  = erosion(cell_mask, erode_disk)
+            # Always keep at least the original nucleus so no cell disappears
+            eroded_mask |= (nuclear_labels == cid)
+            tightened[eroded_mask] = cid
+        cell_labels = tightened
+
     return nuclear_labels, cell_labels.astype(np.int32)
 
 
 # ─── measurement ──────────────────────────────────────────────────────────────
 
-def measure_intensity(fitc: np.ndarray, cell_labels: np.ndarray) -> pd.DataFrame:
+def measure_intensity(
+    dye: np.ndarray,
+    cell_labels: np.ndarray,
+) -> pd.DataFrame:
+    """
+    For each cell region, measure raw dye intensity (no background subtraction):
+      - mean_intensity                : mean pixel value within the cell mask
+      - integrated_intensity          : sum of all pixel values within the cell mask;
+                                        preferred metric when cell size varies between
+                                        conditions, as it captures total uptake per cell
+      - integrated_intensity_per_area : integrated_intensity / pixel_count;
+                                        uptake density — corrects for cell-size bias,
+                                        equivalent to mean_intensity but reported
+                                        explicitly alongside integrated for convenience
+      - pixel_count                   : number of pixels in the cell region (area in px²)
+    """
     records = []
     for cid in range(1, int(cell_labels.max()) + 1):
-        px = fitc[cell_labels == cid]
+        px = dye[cell_labels == cid]
         if px.size == 0:
             continue
+        integrated  = float(px.sum())
+        pixel_count = int(px.size)
         records.append({
-            "cell_id":        cid,
-            "mean_intensity": round(float(px.mean()), 4),
-            "pixel_count":    int(px.size),
+            "cell_id":                         cid,
+            "mean_intensity":                  round(float(px.mean()),         4),
+            "integrated_intensity":            round(integrated,                4),
+            "integrated_intensity_per_area":   round(integrated / pixel_count,  4),
+            "pixel_count":                     pixel_count,
         })
     return pd.DataFrame(records)
 
@@ -196,11 +376,12 @@ def measure_intensity(fitc: np.ndarray, cell_labels: np.ndarray) -> pd.DataFrame
 
 def make_side_by_side(
     rgb:            np.ndarray,
-    fitc:           np.ndarray,
+    dye:            np.ndarray,
     nuclear_labels: np.ndarray,
     cell_labels:    np.ndarray,
     cell_df:        pd.DataFrame,
     image_name:     str,
+    dye_suffix:     str,
     out_path:       Path,
 ) -> None:
     """
@@ -208,7 +389,7 @@ def make_side_by_side(
       1. Contrast-stretched RGB composite with nucleus (blue) and
          cell-boundary (yellow) outlines drawn on top.
       2. Cell regions, each uniquely coloured.
-      3. FITC intensity heat-map restricted to cell regions.
+      3. Dye intensity heat-map restricted to cell regions.
     """
     composite = normalise_rgb(rgb)
 
@@ -218,23 +399,27 @@ def make_side_by_side(
     comp_ann[cell_bounds] = [1.0, 0.85, 0.0]   # yellow = cell edge
     comp_ann[nuc_bounds]  = [0.2, 0.65, 1.0]   # blue   = nucleus edge
 
-    mask_rgb    = label2rgb(cell_labels, bg_label=0, bg_color=(0.08, 0.08, 0.08))
+    mask_rgb = label2rgb(cell_labels, bg_label=0, bg_color=(0.08, 0.08, 0.08))
 
-    fitc_n      = normalise(fitc)
-    fitc_masked = fitc_n.copy()
-    fitc_masked[cell_labels == 0] = 0.0
-    fitc_rgb    = plt.cm.hot(fitc_masked)[..., :3]
+    dye_n      = normalise(dye)
+    dye_masked = dye_n.copy()
+    dye_masked[cell_labels == 0] = 0.0
+    dye_rgb    = plt.cm.hot(dye_masked)[..., :3]
 
-    n_cells = len(cell_df)
+    dye_label  = dye_suffix.lstrip("_")   # e.g. "_ch01" → "ch01"
+    n_cells    = len(cell_df)
+    mean_integ = cell_df["integrated_intensity"].mean()
+
     fig, axes = plt.subplots(1, 3, figsize=(18, 6), facecolor="#0e0e0e")
     fig.suptitle(
-        f"{image_name}   |   {n_cells} cells",
+        f"{image_name}   |   {n_cells} cells   |   "
+        f"mean integrated intensity: {mean_integ:.1f}",
         color="white", fontsize=13, fontweight="bold", y=1.01,
     )
     panels = [
         (comp_ann,  "Original composite  (blue=nucleus | yellow=cell boundary)"),
         (mask_rgb,  f"Cell masks  ({n_cells} cells)"),
-        (fitc_rgb,  "FITC intensity inside cells"),
+        (dye_rgb,   f"Dye ({dye_label}) intensity inside cells"),
     ]
     for ax, (im, title) in zip(axes, panels):
         ax.imshow(im, interpolation="nearest")
@@ -256,23 +441,38 @@ def make_side_by_side(
 
 # ─── main pipeline ────────────────────────────────────────────────────────────
 
-def run_pipeline(folder: str) -> None:
+def run_pipeline(
+    folder: str,
+    actin_suffix: str,
+    dapi_suffix: str,
+    dye_suffix: str,
+) -> None:
     folder_path = Path(folder).resolve()
     if not folder_path.exists():
         sys.exit(f"[ERROR] Folder not found: {folder_path}")
 
-    tif_files = sorted(
-        list(folder_path.glob("*.tif")) + list(folder_path.glob("*.tiff"))
-    )
-    if not tif_files:
-        sys.exit(f"[ERROR] No .tif/.tiff files found in: {folder_path}")
-
     print(f"\n{'='*62}")
     print(f"  Macropinocytosis Analysis Pipeline")
-    print(f"  Folder : {folder_path}")
-    print(f"  Images : {len(tif_files)}")
-    print(f"  Method : DAPI nuclei → actin-bounded expansion")
+    print(f"  Folder      : {folder_path}")
+    print(f"  Triplet mode: {TRIPLET_MODE}")
+    print(f"  Channels    : actin={actin_suffix}  dye={dye_suffix}  dapi={dapi_suffix}")
+    print(f"  Method      : DAPI nuclei → actin-bounded expansion")
+    print(f"  Intensity   : raw pixel values, no background subtraction")
+    print(f"  Primary metric: integrated intensity per cell")
     print(f"{'='*62}\n")
+
+    triplets = find_triplets(folder_path, actin_suffix, dapi_suffix, dye_suffix)
+    if not triplets:
+        sys.exit(
+            "[ERROR] No complete channel triplets found.\n"
+            f"  Looking for actin suffix '{actin_suffix}' as anchor,\n"
+            f"  with siblings '{dye_suffix}' (dye) and '{dapi_suffix}' (dapi)\n"
+            f"  in: {folder_path}\n"
+            f"  Tip: use --actin / --dye / --dapi to change which suffix maps to which role.\n"
+            f"  Or set TRIPLET_MODE = 'sorted_order' if files have no shared base name."
+        )
+
+    print(f"  Found {len(triplets)} image group(s).\n")
 
     results_dir      = folder_path / RESULTS_DIR_NAME
     side_by_side_dir = results_dir / "side_by_side"
@@ -280,11 +480,14 @@ def run_pipeline(folder: str) -> None:
 
     summary_rows = []
 
-    for idx, tif_path in enumerate(tif_files, start=1):
-        print(f"[{idx}/{len(tif_files)}] {tif_path.name}")
+    for idx, (f_actin, f_dye, f_dapi, basename) in enumerate(triplets, start=1):
+        print(f"[{idx}/{len(triplets)}] {basename}")
+        print(f"    actin ({actin_suffix}) : {f_actin.name}")
+        print(f"    dye   ({dye_suffix}) : {f_dye.name}")
+        print(f"    dapi  ({dapi_suffix}) : {f_dapi.name}")
 
         try:
-            actin, fitc, dapi, rgb = load_tif(tif_path)
+            actin, dye, dapi, rgb = load_triplet(f_actin, f_dye, f_dapi)
         except Exception as exc:
             print(f"    WARNING: Could not load — {exc}  (skipping)\n")
             continue
@@ -297,30 +500,34 @@ def run_pipeline(folder: str) -> None:
         if n_cells == 0:
             print("    WARNING: No cells found.\n")
             summary_rows.append({
-                "image":              tif_path.name,
-                "n_cells":            0,
-                "mean_intensity_all": float("nan"),
+                "image":                      basename,
+                "n_cells":                    0,
+                "mean_integrated_intensity":  float("nan"),
+                "total_integrated_intensity": float("nan"),
             })
             continue
 
-        cell_df  = measure_intensity(fitc, cell_labels)
-        mean_all = float(cell_df["mean_intensity"].mean())
-        print(f"    Mean FITC intensity across all cells: {mean_all:.4f}")
+        cell_df     = measure_intensity(dye, cell_labels)
+        mean_integ  = float(cell_df["integrated_intensity"].mean())
+        total_integ = float(cell_df["integrated_intensity"].sum())
+        print(f"    Mean integrated intensity per cell : {mean_integ:.4f}")
+        print(f"    Total integrated intensity (image) : {total_integ:.4f}")
 
-        # side-by-side panel
-        panel_path = side_by_side_dir / (tif_path.stem + "_analysis.png")
-        make_side_by_side(rgb, fitc, nuclear_labels, cell_labels,
-                          cell_df, tif_path.name, panel_path)
+        panel_path = side_by_side_dir / (basename + "_analysis.png")
+        make_side_by_side(
+            rgb, dye, nuclear_labels, cell_labels,
+            cell_df, basename, dye_suffix, panel_path,
+        )
 
-        # per-cell CSV
-        per_cell_csv = results_dir / (tif_path.stem + "_per_cell.csv")
-        cell_df.insert(0, "image", tif_path.name)
+        per_cell_csv = results_dir / (basename + "_per_cell.csv")
+        cell_df.insert(0, "image", basename)
         cell_df.to_csv(str(per_cell_csv), index=False)
 
         summary_rows.append({
-            "image":              tif_path.name,
-            "n_cells":            n_cells,
-            "mean_intensity_all": round(mean_all, 4),
+            "image":                      basename,
+            "n_cells":                    n_cells,
+            "mean_integrated_intensity":  round(mean_integ,  4),
+            "total_integrated_intensity": round(total_integ, 4),
         })
         print()
 
@@ -330,16 +537,34 @@ def run_pipeline(folder: str) -> None:
         return
 
     summary_df = pd.DataFrame(summary_rows)
-    csv_path   = results_dir / "summary_table.csv"
-    xlsx_path  = results_dir / "summary_table.xlsx"
-    summary_df.to_csv(str(csv_path),  index=False)
-    summary_df.to_excel(str(xlsx_path), index=False)
+
+    # Folder-level totals row — grand mean is weighted by cell count per image
+    valid             = summary_df.dropna(subset=["mean_integrated_intensity"])
+    total_n_cells     = int(valid["n_cells"].sum())
+    grand_mean_integ  = (
+        float(valid["mean_integrated_intensity"].mul(valid["n_cells"]).sum() / total_n_cells)
+        if total_n_cells > 0 else float("nan")
+    )
+    grand_total_integ = float(valid["total_integrated_intensity"].sum())
+
+    totals_row = pd.DataFrame([{
+        "image":                      "TOTALS",
+        "n_cells":                    total_n_cells,
+        "mean_integrated_intensity":  round(grand_mean_integ,  4),
+        "total_integrated_intensity": round(grand_total_integ, 4),
+    }])
+    summary_with_totals = pd.concat([summary_df, totals_row], ignore_index=True)
+
+    csv_path  = results_dir / "summary_table.csv"
+    xlsx_path = results_dir / "summary_table.xlsx"
+    summary_with_totals.to_csv(str(csv_path),  index=False)
+    summary_with_totals.to_excel(str(xlsx_path), index=False)
 
     print("Summary tables written:")
     print(f"  {csv_path}")
     print(f"  {xlsx_path}")
     print()
-    print(summary_df.to_string(index=False))
+    print(summary_with_totals.to_string(index=False))
     print(f"\nDone.  All outputs in: {results_dir}\n")
 
 
@@ -347,10 +572,36 @@ def run_pipeline(folder: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Macropinocytosis pipeline: DAPI segmentation + "
-                    "actin-bounded cell expansion + FITC intensity.")
+        description=(
+            "Macropinocytosis pipeline: loads per-channel TIF files, "
+            "segments cells from DAPI with actin-bounded expansion, "
+            "and measures raw dye intensity (mean and integrated per cell)."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "folder",
-        help="Path to folder containing .tif / .tiff microscopy images.")
+        help="Path to folder containing channel TIF files.",
+    )
+    parser.add_argument(
+        "--actin", metavar="SUFFIX",
+        default=DEFAULT_ACTIN_SUFFIX,
+        help="Filename suffix (without extension) for the actin channel.",
+    )
+    parser.add_argument(
+        "--dapi", metavar="SUFFIX",
+        default=DEFAULT_DAPI_SUFFIX,
+        help="Filename suffix (without extension) for the DAPI channel.",
+    )
+    parser.add_argument(
+        "--dye", metavar="SUFFIX",
+        default=DEFAULT_DYE_SUFFIX,
+        help="Filename suffix (without extension) for the dye/FITC channel.",
+    )
     args = parser.parse_args()
-    run_pipeline(args.folder)
+    run_pipeline(
+        args.folder,
+        actin_suffix=args.actin,
+        dapi_suffix=args.dapi,
+        dye_suffix=args.dye,
+    )
