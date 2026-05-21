@@ -1,5 +1,3 @@
-## sgRNA2 for snap, sgrna1 for pelp, ambra
-
 """
 Macropinocytosis 63x Microscopy Image Analysis Pipeline
 =====================================================
@@ -97,9 +95,9 @@ from scipy.ndimage import distance_transform_edt
 TRIPLET_MODE = "suffix_match"   # "suffix_match" | "sorted_order"
 
 # Default channel suffixes — override at runtime with --actin / --dapi / --dye
-DEFAULT_ACTIN_SUFFIX = "_ch00"
+DEFAULT_ACTIN_SUFFIX = "_ch02"
 DEFAULT_DYE_SUFFIX   = "_ch01"
-DEFAULT_DAPI_SUFFIX  = "_ch02"
+DEFAULT_DAPI_SUFFIX  = "_ch00"
 
 # ── DAPI nucleus detection ───────────────────────────────────────────────────
 DAPI_BLUR_SIGMA     = 4      # gaussian smoothing before threshold (pixels)
@@ -112,7 +110,7 @@ WATERSHED_MIN_DIST  = 20     # minimum distance in px between nucleus peaks for
 
 # ── Cell body expansion ───────────────────────────────────────────────────────
 CELL_EXPANSION_PX   = 150    # max expansion radius from nucleus edge (pixels)
-ACTIN_PERCENTILE    = 85     # actin pixels above this percentile define cell
+ACTIN_PERCENTILE    = 90     # actin pixels above this percentile define cell
                              # territory.  Lower = more permissive expansion.
 
 # ── Output ────────────────────────────────────────────────────────────────────

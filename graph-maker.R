@@ -75,11 +75,11 @@ COLOURS <- c(
 # ── Metric to plot ────────────────────────────────────────────────────────────
 #    "integrated_intensity"  ← recommended (total uptake per cell)
 #    "mean_intensity"        ← average pixel intensity per cell
-METRIC <- "mean_intensity"
+METRIC <- "integrated_intensity"
 
 # ── Axis Labels ─────────────────────────────────────────────────────────────
 X_LABEL <- "[Doxycycline]"
-Y_LABEL <- "Mean Intensity (AU)"
+Y_LABEL <- "Integrated Intensity (AU)"
 
 # ── Plot title (set to "" for no title) ──────────────────────────────────────
 PLOT_TITLE <- "SF188 PELP1 pInducer Assay"
@@ -90,8 +90,9 @@ OUTPUT_STEM <- "macropinocytosis_plot"   # filename without extension
 SAVE_PNG    <- TRUE
 SAVE_PDF    <- TRUE
 PNG_WIDTH   <- 5
-PNG_HEIGHT  <- 4
+PNG_HEIGHT  <- 5
 BASE_FONT_SIZE <- 14
+PNG_DPI <- 300
 
 # ── Plot aesthetics (optional fine-tuning) ────────────────────────────────────
 BAR_ALPHA      <- 0.75   # bar transparency  (0 = transparent, 1 = solid)
@@ -240,7 +241,7 @@ p <- ggplot2::ggplot(
     # Title
     plot.title = ggplot2::element_text(
       face   = "bold",
-      size   = 20,
+      size   = 12,
       hjust  = 0.5,
       margin = ggplot2::margin(b = 14)
     ),
