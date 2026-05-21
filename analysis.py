@@ -1,3 +1,5 @@
+## sgRNA2 for snap, sgrna1 for pelp, ambra
+
 """
 Macropinocytosis 63x Microscopy Image Analysis Pipeline
 =====================================================
@@ -80,8 +82,9 @@ import matplotlib.colors as mcolors
 from skimage.color import label2rgb
 from skimage.filters import gaussian, threshold_otsu
 from skimage.measure import label as sklabel, regionprops
-from skimage.morphology import closing, disk, erosion
-from skimage.segmentation import expand_labels, find_boundaries
+from skimage.morphology import closing, disk
+from skimage.segmentation import expand_labels, find_boundaries, watershed
+from scipy.ndimage import distance_transform_edt
 
 
 # ═══════════════════════════ TUNABLE PARAMETERS ═══════════════════════════════
@@ -103,14 +106,14 @@ DAPI_BLUR_SIGMA     = 4      # gaussian smoothing before threshold (pixels)
 DAPI_CLOSE_RADIUS   = 8      # morphological closing to fill holes in nuclei
 MIN_NUCLEUS_AREA    = 5000   # minimum nucleus area in px² (removes debris)
 EXCLUDE_EDGE_NUCLEI = False  # if True, skip nuclei touching the image border
+WATERSHED_MIN_DIST  = 20     # minimum distance in px between nucleus peaks for
+                             # watershed splitting; increase to split less aggressively,
+                             # decrease to split more.  Set to 0 to disable.
 
 # ── Cell body expansion ───────────────────────────────────────────────────────
 CELL_EXPANSION_PX   = 150    # max expansion radius from nucleus edge (pixels)
-ACTIN_PERCENTILE    = 50     # actin pixels above this percentile define cell
+ACTIN_PERCENTILE    = 85     # actin pixels above this percentile define cell
                              # territory.  Lower = more permissive expansion.
-BOUNDARY_ERODE_PX   = 4     # shrink each cell mask inward by this many pixels
-                             # after expansion, to pull the boundary just inside
-                             # the actin ring and avoid overcounting cell area.
 
 # ── Output ────────────────────────────────────────────────────────────────────
 RESULTS_DIR_NAME = "results"
@@ -295,8 +298,20 @@ def segment_cells(actin: np.ndarray, dapi: np.ndarray):
     nuclear_bin = dapi_smooth > thresh
     nuclear_bin = closing(nuclear_bin, disk(DAPI_CLOSE_RADIUS))
 
-    # ── Step 2: connected-component labelling (no watershed splitting) ───────
-    raw_labels, _ = sklabel(nuclear_bin, return_num=True)
+    # ── Step 2: connected-component labelling + watershed splitting ─────────
+    raw_labels = sklabel(nuclear_bin)
+    if WATERSHED_MIN_DIST > 0:
+        distance   = distance_transform_edt(nuclear_bin)
+        from skimage.feature import peak_local_max
+        peak_coords = peak_local_max(
+            distance,
+            min_distance=WATERSHED_MIN_DIST,
+            labels=nuclear_bin,
+        )
+        markers = np.zeros_like(nuclear_bin, dtype=np.int32)
+        for i, (r, c) in enumerate(peak_coords, start=1):
+            markers[r, c] = i
+        raw_labels = watershed(-distance, markers, mask=nuclear_bin)
 
     # ── Step 3: filter nuclei ────────────────────────────────────────────────
     nuclear_labels = np.zeros_like(raw_labels, dtype=np.int32)
@@ -319,20 +334,6 @@ def segment_cells(actin: np.ndarray, dapi: np.ndarray):
     # ── Step 5: expand nuclei outward, clipped to cell territory ─────────────
     cell_labels = expand_labels(nuclear_labels, distance=CELL_EXPANSION_PX)
     cell_labels[~cell_territory] = 0
-
-    # ── Step 6: erode each cell mask inward to tighten boundary fit ──────────
-    # Erodes the binary footprint of each label independently so cells don't
-    # bleed into each other; nuclei are never eroded below their original extent.
-    if BOUNDARY_ERODE_PX > 0:
-        erode_disk = disk(BOUNDARY_ERODE_PX)
-        tightened  = np.zeros_like(cell_labels)
-        for cid in range(1, int(cell_labels.max()) + 1):
-            cell_mask    = cell_labels == cid
-            eroded_mask  = erosion(cell_mask, erode_disk)
-            # Always keep at least the original nucleus so no cell disappears
-            eroded_mask |= (nuclear_labels == cid)
-            tightened[eroded_mask] = cid
-        cell_labels = tightened
 
     return nuclear_labels, cell_labels.astype(np.int32)
 
